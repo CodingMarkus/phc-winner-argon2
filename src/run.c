@@ -17,7 +17,6 @@
 
 #define _GNU_SOURCE 1
 
-#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,8 +36,9 @@
 #define UNUSED_PARAMETER(x) (void)(x)
 
 static void usage(const char *cmd) {
-    printf("Usage:  %s [-h] salt [-i|-d|-id] [-t iterations] [-m memory] "
-           "[-p parallelism] [-l hash length] [-e|-r] [-v (10|13)]\n",
+    printf("Usage:  %s [-h] salt [-i|-d|-id] [-t iterations] "
+           "[-m log2(memory in KiB) | -k memory in KiB] [-p parallelism] "
+           "[-l hash length] [-e|-r] [-v (10|13)]\n",
            cmd);
     printf("\tPassword is read from stdin\n");
     printf("Parameters:\n");
@@ -50,6 +50,8 @@ static void usage(const char *cmd) {
            T_COST_DEF);
     printf("\t-m N\t\tSets the memory usage of 2^N KiB (default %d)\n",
            LOG_M_COST_DEF);
+    printf("\t-k N\t\tSets the memory usage of N KiB (default %d)\n",
+           1 << LOG_M_COST_DEF);
     printf("\t-p N\t\tSets parallelism to N threads (default %d)\n",
            THREADS_DEF);
     printf("\t-l N\t\tSets hash output length to N bytes (default %d)\n",
@@ -89,11 +91,11 @@ Base64-encoded hash string
 @raw_only display only the hexadecimal of the hash
 @version Argon2 version
 */
-static void run(uint32_t outlen, char *pwd, char *salt, uint32_t t_cost,
+static void run(uint32_t outlen, char *pwd, size_t pwdlen, char *salt, uint32_t t_cost,
                 uint32_t m_cost, uint32_t lanes, uint32_t threads,
                 argon2_type type, int encoded_only, int raw_only, uint32_t version) {
     clock_t start_time, stop_time;
-    size_t pwdlen, saltlen, encodedlen;
+    size_t saltlen, encodedlen;
     int result;
     unsigned char * out = NULL;
     char * encoded = NULL;
@@ -105,11 +107,10 @@ static void run(uint32_t outlen, char *pwd, char *salt, uint32_t t_cost,
     }
 
     if (!salt) {
-        clear_internal_memory(pwd, strlen(pwd));
+        clear_internal_memory(pwd, pwdlen);
         fatal("salt missing");
     }
 
-    pwdlen = strlen(pwd);
     saltlen = strlen(salt);
     if(UINT32_MAX < saltlen) {
         fatal("salt is too long");
@@ -119,14 +120,14 @@ static void run(uint32_t outlen, char *pwd, char *salt, uint32_t t_cost,
 
     out = malloc(outlen + 1);
     if (!out) {
-        clear_internal_memory(pwd, strlen(pwd));
+        clear_internal_memory(pwd, pwdlen);
         fatal("could not allocate memory for output");
     }
 
     encodedlen = argon2_encodedlen(t_cost, m_cost, lanes, (uint32_t)saltlen, outlen, type);
     encoded = malloc(encodedlen + 1);
     if (!encoded) {
-        clear_internal_memory(pwd, strlen(pwd));
+        clear_internal_memory(pwd, pwdlen);
         fatal("could not allocate memory for hash");
     }
 
@@ -174,11 +175,12 @@ int main(int argc, char *argv[]) {
     uint32_t threads = THREADS_DEF;
     argon2_type type = Argon2_i; /* Argon2i is the default type */
     int types_specified = 0;
+    int m_cost_specified = 0;
     int encoded_only = 0;
     int raw_only = 0;
     uint32_t version = ARGON2_VERSION_NUMBER;
     int i;
-    size_t n;
+    size_t pwdlen;
     char pwd[MAX_PASS_LEN], *salt;
 
     if (argc < 2) {
@@ -190,17 +192,12 @@ int main(int argc, char *argv[]) {
     }
 
     /* get password from stdin */
-    n = fread(pwd, 1, sizeof pwd - 1, stdin);
-    if(n < 1) {
+    pwdlen = fread(pwd, 1, sizeof pwd, stdin);
+    if(pwdlen < 1) {
         fatal("no password read");
     }
-    if(n == MAX_PASS_LEN-1) {
+    if(pwdlen == MAX_PASS_LEN) {
         fatal("Provided password longer than supported in command line utility");
-    }
-
-    pwd[n] = '\0';
-    if (pwd[n - 1] == '\n') {
-        pwd[n - 1] = '\0';
     }
 
     salt = argv[1];
@@ -213,6 +210,10 @@ int main(int argc, char *argv[]) {
             usage(argv[0]);
             return 1;
         } else if (!strcmp(a, "-m")) {
+            if (m_cost_specified) {
+                fatal("-m or -k can only be used once");
+            }
+            m_cost_specified = 1;
             if (i < argc - 1) {
                 i++;
                 input = strtoul(argv[i], NULL, 10);
@@ -227,6 +228,25 @@ int main(int argc, char *argv[]) {
                 continue;
             } else {
                 fatal("missing -m argument");
+            }
+        } else if (!strcmp(a, "-k")) {
+            if (m_cost_specified) {
+                fatal("-m or -k can only be used once");
+            }
+            m_cost_specified = 1;
+            if (i < argc - 1) {
+                i++;
+                input = strtoul(argv[i], NULL, 10);
+                if (input == 0 || input == ULONG_MAX) {
+                    fatal("bad numeric input for -k");
+                }
+                m_cost = ARGON2_MIN(input, UINT32_C(0xFFFFFFFF));
+                if (m_cost > ARGON2_MAX_MEMORY) {
+                    fatal("m_cost overflow");
+                }
+                continue;
+            } else {
+                fatal("missing -k argument");
             }
         } else if (!strcmp(a, "-t")) {
             if (i < argc - 1) {
@@ -304,12 +324,12 @@ int main(int argc, char *argv[]) {
 
     if(!encoded_only && !raw_only) {
         printf("Type:\t\t%s\n", argon2_type2string(type, 1));
-        printf("Iterations:\t%" PRIu32 " \n", t_cost);
-        printf("Memory:\t\t%" PRIu32 " KiB\n", m_cost);
-        printf("Parallelism:\t%" PRIu32 " \n", lanes);
+        printf("Iterations:\t%u\n", t_cost);
+        printf("Memory:\t\t%u KiB\n", m_cost);
+        printf("Parallelism:\t%u\n", lanes);
     }
 
-    run(outlen, pwd, salt, t_cost, m_cost, lanes, threads, type,
+    run(outlen, pwd, pwdlen, salt, t_cost, m_cost, lanes, threads, type,
        encoded_only, raw_only, version);
 
     return ARGON2_OK;
